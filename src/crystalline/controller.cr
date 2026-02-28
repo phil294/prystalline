@@ -126,6 +126,7 @@ class Crystalline::Controller
         workspace.compile(
           @server,
           URI.parse(file_uri),
+          in_memory: true,
           discard_nil_cached_result: true,
         )
       }

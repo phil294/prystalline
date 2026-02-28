@@ -64,6 +64,12 @@ class Crystalline::Workspace
   def save_document(server : LSP::Server, params : LSP::DidSaveTextDocumentParams)
     file_uri = params.text_document.uri
     @result_cache.invalidate(file_uri)
+    # Also invalidate the project entry point cache so recompilation picks up changes
+    @opened_documents[file_uri]?.try { |document|
+      document.project?.try(&.entry_point?).try { |entry|
+        @result_cache.invalidate(entry.to_s)
+      }
+    }
   end
 
   def format_document(params : LSP::DocumentFormattingParams) : {String, TextDocument}?
@@ -182,6 +188,22 @@ class Crystalline::Workspace
             file_path = URI.parse(uri_str).decoded_path
             file_overrides[file_path] = contents
           }
+        else
+          # Even when not in-memory, preprocess opened documents for Prystal support
+          if @opened_documents.size > 0
+            file_overrides = Hash(String, String).new
+            @opened_documents.each { |uri_str, text_document|
+              contents = fix_source(text_document.contents)
+              file_path = URI.parse(uri_str).decoded_path
+              file_overrides[file_path] = contents
+
+              if target_string == uri_str
+                sources = [
+                  Crystal::Compiler::Source.new(target.decoded_path, contents),
+                ]
+              end
+            }
+          end
         end
 
         lib_path = project.try(&.default_lib_path)
@@ -602,13 +624,7 @@ class Crystalline::Workspace
   end
 
   private def fix_source(source : String) : String
-    # LSP::Log.info { "Fixing source: #{source}" }
-    Crystal::Parser.parse(source)
-    # LSP::Log.info { "No need to fix source!" }
-    source
-  rescue
-    fixed_source = BrokenSourceFixer.fix(source)
-    # LSP::Log.info { "Fixed source: #{fixed_source}" }
-    fixed_source
+    # Always preprocess to support Prystal indentation-based syntax
+    BrokenSourceFixer.fix(source)
   end
 end

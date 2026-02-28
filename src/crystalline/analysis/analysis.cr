@@ -20,11 +20,10 @@ module Crystalline::Analysis
   # Compile a target *file_uri*.
   def self.compile(server : LSP::Server, file_uri : URI, *, lib_path : String? = nil, file_overrides : Hash(String, String)? = nil, ignore_diagnostics = false, wants_doc = false, fail_fast = false, top_level = false, compiler_flags : Array(String) = [] of String)
     if file_uri.scheme == "file"
-      file = File.new file_uri.decoded_path
+      file_contents = BrokenSourceFixer.fix(File.read(file_uri.decoded_path))
       sources = [
-        Crystal::Compiler::Source.new(file_uri.decoded_path, file.gets_to_end),
+        Crystal::Compiler::Source.new(file_uri.decoded_path, file_contents),
       ]
-      file.close
       self.compile(server, sources, lib_path: lib_path, file_overrides: file_overrides, ignore_diagnostics: ignore_diagnostics, wants_doc: wants_doc, top_level: top_level, compiler_flags: compiler_flags)
     end
   end

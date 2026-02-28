@@ -40,7 +40,9 @@ module Crystal
         filenames.each do |filename|
           if @program.requires.add?(filename)
             # Use file_overrides is needed to load files from memory.
-            file_contents = @program.file_overrides.try(&.[filename]?) || File.read(filename)
+            # If reading from disk, apply BrokenSourceFixer to support
+            # Prystal indentation-based syntax in non-opened files.
+            file_contents = @program.file_overrides.try(&.[filename]?) || Crystalline::BrokenSourceFixer.fix(File.read(filename))
             parser = Parser.new file_contents, @program.string_pool
             parser.filename = filename
             parser.wants_doc = @program.wants_doc?

@@ -19,8 +19,30 @@ class Crystalline::BrokenSourceFixer
     lines.each_with_index do |line, line_index|
       next if line.blank?
 
+      stripped = line.lstrip
+
+      # Skip macro/template syntax lines (same as prystalc preprocessor)
+      if stripped.includes?("{% ") || stripped.includes?(" %}") || stripped.includes?("{{") || stripped.includes?("}}")
+        next
+      end
+
       keyword = line_keyword(line)
       indent = line_indent(line)
+
+      # Detect postfix block keywords (e.g., x = case, base = if)
+      if keyword.nil? && stripped.match(/=\s*(case|if|unless)\b/)
+        keyword = $1.to_s
+      end
+
+      # Detect mid-line 'do' blocks (e.g., array.map do |x|, spawn do)
+      if keyword.nil? && stripped.match(/\bdo(\s+(\|.*?\|)?)?\s*$/)
+        keyword = "do"
+      end
+
+      # Abstract method declarations with return types have no body
+      if keyword && !closing_keyword?(keyword) && stripped.starts_with?("abstract def") && stripped.match(/:\s*\w+[\[\],|()\s]*\s*$/)
+        keyword = nil
+      end
 
       while true
         last_info = stack.last?
@@ -33,15 +55,22 @@ class Crystalline::BrokenSourceFixer
 
         # We have a wrong indentation so we fix/close the opening keyword
         # by adding an "end" (or "}") to it.
-        last_line = lines[line_index - 1]
+        # Walk backwards to find a line that isn't blank or a comment,
+        # so we don't append "; end" inside a comment.
+        target_index = line_index - 1
+        while target_index > 0 && (lines[target_index].blank? || lines[target_index].lstrip.starts_with?('#'))
+          target_index -= 1
+        end
 
-        lines[line_index - 1] =
-          if last_line.blank?
+        target_line = lines[target_index]
+
+        lines[target_index] =
+          if target_line.blank?
             # If the line is empty we can change it to an end
             # and even use the correct indent.
-            "#{("  " * last_info.indent)}#{closing_keyword}"
+            "#{(" " * last_info.indent)}#{closing_keyword}"
           else
-            "#{last_line}; #{closing_keyword}"
+            insert_before_comment(target_line, "; #{closing_keyword}")
           end
 
         stack.pop
@@ -66,7 +95,19 @@ class Crystalline::BrokenSourceFixer
     end
 
     while (line_info = stack.pop?)
-      lines[-1] = "#{lines[-1]}; #{closing_keyword(line_info)}"
+      # Walk backwards from end to find a non-blank, non-comment line
+      target_index = lines.size - 1
+      while target_index > 0 && (lines[target_index].blank? || lines[target_index].lstrip.starts_with?('#'))
+        target_index -= 1
+      end
+
+      target_line = lines[target_index]
+      lines[target_index] =
+        if target_line.blank?
+          "#{(" " * line_info.indent)}#{closing_keyword(line_info)}"
+        else
+          insert_before_comment(target_line, "; #{closing_keyword(line_info)}")
+        end
     end
 
     lines.join("\n")
@@ -79,24 +120,32 @@ class Crystalline::BrokenSourceFixer
     end
 
     if non_whitespace_char_index
-      non_whitespace_char_index // 2
+      non_whitespace_char_index
     else
       0
     end
   end
 
   private def self.line_keyword(line : String) : String?
+    # Strip trailing inline comments so patterns with $ anchors
+    # and ends_with? work correctly on commented lines.
+    line = strip_inline_comment(line)
+
     if line.starts_with?(/\s*
       (
         if |
         unless |
         while |
         until |
+        case |
         ((private|protected)\s+)?def |
         (private\s+)?(abstract\s+)?class |
         (private\s+)?(abstract\s+)?struct |
         (private\s+)?module |
         (private\s+)?enum |
+        (private\s+)?lib |
+        (private\s+)?union |
+        (private\s+)?macro |
         (private\s+)?annotation
       )\s/x)
       $1
@@ -108,14 +157,19 @@ class Crystalline::BrokenSourceFixer
       "{"
     elsif line.ends_with?(/\s*[\w\d]\s*{(\s*\|[^|]+\|)?\s*$/)
       "{"
-    elsif line.matches?(/\s*end\s*$/)
+    elsif line.matches?(/^\s*end\b/)
       "end"
-    elsif line.matches?(/\s*}\s*$/)
+    elsif line.matches?(/^\s*}(\s*$|[.)\],;])/)
+
       "}"
     elsif line.matches?(/\s*else\s*$/)
       "else"
     elsif line.starts_with?(/\s*elsif\s+/)
       "elsif"
+    elsif line.starts_with?(/\s*when\s+/)
+      "when"
+    elsif line.starts_with?(/\s*in\s+/)
+      "in"
     elsif line.starts_with?(/\s*rescue(\b|\s)/)
       "rescue"
     elsif line.matches?(/\s*ensure\s*$/)
@@ -133,8 +187,63 @@ class Crystalline::BrokenSourceFixer
     keyword == "{" ? "}" : "end"
   end
 
+  # Insert text before any trailing inline comment, handling strings.
+  private def self.insert_before_comment(line : String, insertion : String) : String
+    comment_index = find_comment_index(line)
+
+    if comment_index
+      code_part = line[0...comment_index].rstrip
+      comment_part = line[comment_index..]
+      "#{code_part}#{insertion} #{comment_part}"
+    else
+      "#{line}#{insertion}"
+    end
+  end
+
+  # Strip trailing inline comment, returning just the code portion (rstripped).
+  private def self.strip_inline_comment(line : String) : String
+    comment_index = find_comment_index(line)
+    comment_index ? line[0...comment_index].rstrip : line
+  end
+
+  # Find the index of a trailing `#` comment that isn't inside a string.
+  # Returns nil if no inline comment is found.
+  private def self.find_comment_index(line : String) : Int32?
+    in_single_quote = false
+    in_double_quote = false
+    escape_next = false
+
+    line.each_char_with_index do |char, i|
+      if escape_next
+        escape_next = false
+        next
+      end
+
+      if char == '\\' && (in_single_quote || in_double_quote)
+        escape_next = true
+        next
+      end
+
+      if char == '"' && !in_single_quote
+        in_double_quote = !in_double_quote
+        next
+      end
+
+      if char == '\'' && !in_double_quote
+        in_single_quote = !in_single_quote
+        next
+      end
+
+      if char == '#' && !in_single_quote && !in_double_quote
+        return i
+      end
+    end
+
+    nil
+  end
+
   private def self.closing_keyword?(keyword : String)
-    keyword.in?("end", "else", "elsif", "rescue", "ensure", "}")
+    keyword.in?("end", "else", "elsif", "when", "in", "rescue", "ensure", "}")
   end
 
   private def self.wrong_indent?(
@@ -171,6 +280,10 @@ class Crystalline::BrokenSourceFixer
     end
 
     if last_info.keyword == "unless" && keyword == "else"
+      return false
+    end
+
+    if last_info.keyword == "case" && keyword.in?("when", "in", "else")
       return false
     end
 
