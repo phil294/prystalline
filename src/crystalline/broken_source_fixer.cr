@@ -21,6 +21,9 @@ class Crystalline::BrokenSourceFixer
 
       stripped = line.lstrip
 
+      # Skip standalone comment lines — they shouldn't trigger indentation checks
+      next if stripped.starts_with?('#')
+
       # Skip macro/template syntax lines (same as prystalc preprocessor)
       if stripped.includes?("{% ") || stripped.includes?(" %}") || stripped.includes?("{{") || stripped.includes?("}}")
         next
