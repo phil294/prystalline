@@ -1,10 +1,14 @@
 class Crystalline::BrokenSourceFixer
   # Keep track of opening and closing keywords, and their idents,
   # as they happen in the code.
+  # had_content: true if any non-skipped line with deeper indent was seen
+  # after this keyword was pushed. Used to decide if macro lines at the
+  # same indent should trigger closure.
   record LineInfo,
     line_index : Int32,
     indent : Int32,
-    keyword : String
+    keyword : String,
+    had_content : Bool = false
 
   # Try to fix a broken source code by adding missing "end" and "}"
   # according to indentation.
@@ -24,27 +28,38 @@ class Crystalline::BrokenSourceFixer
       # Skip standalone comment lines — they shouldn't trigger indentation checks
       next if stripped.starts_with?('#')
 
-      # Skip macro/template syntax lines (same as prystalc preprocessor)
-      if stripped.includes?("{% ") || stripped.includes?(" %}") || stripped.includes?("{{") || stripped.includes?("}}")
-        next
-      end
+      # Macro directive lines ({% %}) participate in indent checks but don't
+      # push or match keywords. At equal indent they only trigger closure
+      # if the block had indented content (had_content).
+      # Lines with {{ }} interpolation that aren't pure macro directives
+      # are treated as normal code.
+      is_macro_line = stripped.starts_with?("{%") || stripped.starts_with?("{% ")
 
-      keyword = line_keyword(line)
+      keyword = is_macro_line ? nil : line_keyword(line)
       indent = line_indent(line)
 
-      # Detect postfix block keywords (e.g., x = case, base = if)
-      if keyword.nil? && stripped.match(/=\s*(case|if|unless)\b/)
-        keyword = $1.to_s
-      end
+      # Mark stack entries that have seen indented content
+      stack.last?.try { |info|
+        if indent > info.indent && !info.had_content
+          stack[-1] = info.copy_with(had_content: true)
+        end
+      }
 
-      # Detect mid-line 'do' blocks (e.g., array.map do |x|, spawn do)
-      if keyword.nil? && stripped.match(/\bdo(\s+(\|.*?\|)?)?\s*$/)
-        keyword = "do"
-      end
+      unless is_macro_line
+        # Detect postfix block keywords (e.g., x = case, base = if)
+        if keyword.nil? && stripped.match(/=\s*(case|if|unless)\b/)
+          keyword = $1.to_s
+        end
 
-      # Abstract method declarations with return types have no body
-      if keyword && !closing_keyword?(keyword) && stripped.starts_with?("abstract def") && stripped.match(/:\s*\w+[\[\],|()\s]*\s*$/)
-        keyword = nil
+        # Detect mid-line 'do' blocks (e.g., array.map do |x|, spawn do)
+        if keyword.nil? && stripped.match(/\bdo(\s+(\|.*?\|)?)?\s*$/)
+          keyword = "do"
+        end
+
+        # Abstract method declarations with return types have no body
+        if keyword && !closing_keyword?(keyword) && stripped.starts_with?("abstract def") && stripped.match(/:\s*\w+[\[\],|()\s]*\s*$/)
+          keyword = nil
+        end
       end
 
       while true
@@ -53,13 +68,28 @@ class Crystalline::BrokenSourceFixer
 
         closing_keyword = closing_keyword(last_info)
 
-        # Nothing to fix unless there's a wrong indent
-        break unless wrong_indent?(indent, keyword, closing_keyword, last_info, line)
+        # Nothing to fix unless there's a wrong indent.
+        # Macro directive lines only trigger closure when:
+        # - At strictly lesser indent, OR
+        # - At equal indent with had_content, but NOT for blocks that
+        #   commonly have same-indent continuations (case/when, if/else).
+        if is_macro_line
+          if indent < last_info.indent
+            # Definitely close
+          elsif indent == last_info.indent && last_info.had_content && !last_info.keyword.in?("case", "if", "unless")
+            # Close blocks whose body is always indented
+          else
+            break
+          end
+        else
+          break unless wrong_indent?(indent, keyword, closing_keyword, last_info, line)
+        end
 
         # We have a wrong indentation so we fix/close the opening keyword
         # by adding an "end" (or "}") to it.
-        # Walk backwards to find a line that isn't blank or a comment,
-        # so we don't append "; end" inside a comment.
+        # Walk backwards to find a non-blank, non-comment line.
+        # Don't skip macro lines — appending "; end" after {% end %}
+        # is valid and avoids placing ends inside macro conditionals.
         target_index = line_index - 1
         while target_index > 0 && (lines[target_index].blank? || lines[target_index].lstrip.starts_with?('#'))
           target_index -= 1
@@ -98,9 +128,11 @@ class Crystalline::BrokenSourceFixer
     end
 
     while (line_info = stack.pop?)
-      # Walk backwards from end to find a non-blank, non-comment line
+      # Walk backwards from end to find a non-blank line.
+      # Don't skip macro lines here — appending "; end" after {% end %}
+      # is valid and avoids placing ends inside macro conditionals.
       target_index = lines.size - 1
-      while target_index > 0 && (lines[target_index].blank? || lines[target_index].lstrip.starts_with?('#'))
+      while target_index > 0 && lines[target_index].blank?
         target_index -= 1
       end
 
@@ -188,6 +220,16 @@ class Crystalline::BrokenSourceFixer
 
   private def self.closing_keyword(keyword : String)
     keyword == "{" ? "}" : "end"
+  end
+
+  # Whether a line should be skipped when walking backwards to find
+  # a suitable target for "; end" insertion.
+  private def self.skip_line?(line : String) : Bool
+    return true if line.blank?
+    stripped = line.lstrip
+    return true if stripped.starts_with?('#')
+    return true if stripped.starts_with?("{%") || stripped.starts_with?("{% ")
+    false
   end
 
   # Insert text before any trailing inline comment, handling strings.
